@@ -16,7 +16,7 @@ Tell Grok Bot or run in its terminal:
 cd /workspace
 git clone https://github.com/icaruschan/video-intelligence.git
 cd video-intelligence
-pip install -r requirements.txt
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # ffmpeg must be installed for edit mode
 ```
 
 ### Step 2: Set your Gemini API Key
@@ -57,6 +57,7 @@ bash install_skill.sh claude
 | **`general`** (Default) | Objective video breakdown | Summary, Timeline beats, Audio/Dialogue transcript, Confirmed visual elements, Notable moments. |
 | **`creative`** | UGC, ads, and creator teardowns | Beat map, Audio transcript, Hook, Audience, Angle, Tension, Payoff, CTA, Reusable patterns. |
 | **`repurpose`** | Content recycling & formatting | Content inventory, Audio transcript, 5–8 Timestamped clip & format opportunities. |
+| **`edit`** | Recreate a reference's look & feel | Measured cuts/shots/loudness/onsets/palette + 13-section craft spec (pacing, framing, B-roll, type, captions, motion, elements, transitions, colour, sound, retention, edit brief) as `report.md` + `analysis.json`. |
 
 ---
 
@@ -75,11 +76,28 @@ python scripts/analyze_video.py path/to/webinar.mp4 --mode repurpose
 # High-framerate sampling for fast cuts or small on-screen text
 python scripts/analyze_video.py path/to/video.mp4 --fps 2
 
+# Edit / craft analysis of a short-form reference (ffmpeg + numpy required)
+python scripts/analyze_video.py path/to/reference.mp4 --mode edit            # -> output/reference/
+python scripts/analyze_video.py path/to/reference.mp4 --mode edit --measure-only   # local numbers only, no API
+
+# Save any mode's report to a folder
+python scripts/analyze_video.py path/to/video.mp4 --mode creative --out output/my-video
+
 # Asking a specific question about the video
 python scripts/analyze_video.py path/to/video.mp4 --prompt "What pricing plan is shown on screen?"
 ```
 
 ---
+
+## 🎬 How `edit` mode stays accurate
+
+1. **Measure first** (`scripts/edit_measure.py`): ffprobe metadata, ffmpeg scene-score cuts (merged within 120 ms; soft events 0.15–0.3), shot lengths and cuts/sec, per-second visual-change curve, EBU R128 loudness, silences, spectral-flux onsets, cut↔onset sync with a chance baseline, dominant colours.
+2. **Pass 1** (`scripts/edit_mode.py`): whole clip at 5/3/2 fps (≤30/≤60/≤90 s) with the measurements in the prompt, structured JSON via `response_json_schema` (falls back to JSON mode + tolerant parsing). Required spec slots per section so nothing comes back empty.
+3. **Pass 2**: the window with the most within-shot motion, re-encoded with an absolute timecode strip under the frame, at ~10 fps, for frame-level motion timing.
+4. **Audit**: model "measured" labels not backed by the measured data are downgraded; model event times are reconciled against measured cuts.
+5. Transient 429/503 errors back off exponentially; a fallback model is tried if the main one stays overloaded.
+
+Sound timing is the weak spot (no agent can truly listen yet); `edit_measure.py` has an `earshot` hook for a future sound-event timeline.
 
 ## 🛡️ Grounding & Anti-Hallucination Guardrails
 

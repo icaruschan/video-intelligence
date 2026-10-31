@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""Analyze a local video with Gemini and print a grounded Markdown report."""
+"""Analyze a local video with Gemini and print a grounded Markdown report.
+
+Modes: general / creative / repurpose (Markdown) and edit (measured + structured craft spec:
+analysis.json + report.md; see scripts/edit_mode.py)."""
 
 from __future__ import annotations
 
 import argparse
+import json
 import mimetypes
 import os
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 try:
     from google import genai
@@ -96,12 +102,28 @@ Rules:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("video_path", help="Path to the local video")
-    parser.add_argument("--mode", choices=MODE_INSTRUCTIONS, default="general")
+    parser.add_argument("--mode", choices=[*MODE_INSTRUCTIONS, "edit"], default="general",
+                        help="general | creative | repurpose | edit (craft/motion spec for recreating the look)")
     parser.add_argument("--prompt", help="Additional question or instruction for Gemini")
     parser.add_argument("--fps", type=float, help="Frames sampled per second; use 2+ for fast cuts")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model ID (default: {DEFAULT_MODEL})")
     parser.add_argument("--timeout", type=int, default=300, help="Files API processing timeout in seconds")
     parser.add_argument("--keep-upload", action="store_true", help="Do not delete an uploaded Gemini file")
+    parser.add_argument("--out", help="Output directory (edit mode default: ./output/<video-stem>/; other modes: print only)")
+    edit = parser.add_argument_group("edit mode")
+    edit.add_argument("--scene-threshold", type=float, default=0.3, help="ffmpeg scene score for a hard cut (default 0.3)")
+    edit.add_argument("--detail-window", type=float, default=6.0, help="Seconds for the dense-cut detail pass (default 6)")
+    edit.add_argument("--detail-fps", type=float, default=10.0, help="fps for the detail pass (default 10, capped at source fps)")
+    edit.add_argument("--fallback-model", default="gemini-flash-latest",
+                      help="Model to try if --model stays overloaded (503/429) after retries; '' to disable")
+    edit.add_argument("--no-detail", action="store_true", help="Skip the second, high-fps detail pass")
+    edit.add_argument("--detail-target", choices=["motion", "cuts"], default="motion",
+                      help="Detail window: most within-shot motion (default) or most cuts")
+    edit.add_argument("--detail-start", type=float, help="Force the detail window start (seconds)")
+    edit.add_argument("--no-timecode", action="store_true", help="Do not burn a timecode strip into the detail clip")
+    edit.add_argument("--keep-detail-clip", action="store_true", help="Save the (timecoded) detail clip in the output dir")
+    edit.add_argument("--allow-long", action="store_true", help="Allow clips over 90 s in edit mode (1 fps)")
+    edit.add_argument("--measure-only", action="store_true", help="Edit mode: only run local measurements (no API call)")
     return parser.parse_args()
 
 
@@ -159,19 +181,63 @@ def build_prompt(mode: str, extra_prompt: str | None) -> str:
     return prompt
 
 
+def write_outputs(out_dir: Path, report: str, data: dict | None) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "report.md").write_text(report)
+    if data is not None:
+        (out_dir / "analysis.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    print(f"[info] Wrote {out_dir / 'report.md'}" + (f" and {out_dir / 'analysis.json'}" if data is not None else ""), file=sys.stderr)
+
+
 def main() -> None:
     args = parse_args()
-    if genai is None or types is None:
-        fail("Missing dependency: google-genai. Install it with: python3 -m pip install google-genai")
     if args.fps is not None and args.fps <= 0:
         fail("--fps must be greater than zero.")
     if args.timeout <= 0:
         fail("--timeout must be greater than zero.")
+    path = validate_video(args.video_path)
+
+    if args.mode == "edit" and args.measure_only:
+        import edit_measure
+        data = edit_measure.measure(path, threshold=args.scene_threshold, detail_window=args.detail_window,
+                                    detail_target=args.detail_target)
+        out_dir = Path(args.out) if args.out else Path("output") / path.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "measured.json").write_text(json.dumps(data, indent=2))
+        print(json.dumps(data, indent=2))
+        return
+
+    if genai is None or types is None:
+        fail("Missing dependency: google-genai. Install it with: python3 -m pip install google-genai")
     if not os.getenv("GEMINI_API_KEY"):
         fail("GEMINI_API_KEY is not set. Create a key at https://aistudio.google.com/apikey and export it in your shell.")
 
-    path = validate_video(args.video_path)
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+    if args.mode == "edit":
+        import edit_measure
+        import edit_mode
+        uploads: list[str] = []
+        try:
+            result, report = edit_mode.run_edit_mode(
+                args, client, types, path,
+                lambda p, fps: video_part(client, p, fps, args.timeout), edit_measure)
+            uploads = result.pop("_uploads", [])
+        finally:
+            if not args.keep_upload:
+                for name in uploads:
+                    try:
+                        client.files.delete(name=name)
+                        print("[info] Deleted temporary Gemini upload.", file=sys.stderr)
+                    except Exception as error:
+                        print(f"[warning] Could not delete temporary upload: {error}", file=sys.stderr)
+        out_dir = Path(args.out) if args.out else Path("output") / path.stem
+        write_outputs(out_dir, report, result)
+        print(report)
+        if result.get("error"):
+            raise SystemExit(2)
+        return
+
     uploaded_name = None
     try:
         part, uploaded_name = video_part(client, path, args.fps, args.timeout)
@@ -180,7 +246,10 @@ def main() -> None:
             model=args.model,
             contents=types.Content(parts=[part, types.Part(text=build_prompt(args.mode, args.prompt))]),
         )
-        print(response.text or "(Gemini returned no text.)")
+        text = response.text or "(Gemini returned no text.)"
+        print(text)
+        if args.out:
+            write_outputs(Path(args.out), text, None)
     finally:
         if uploaded_name and not args.keep_upload:
             try:
