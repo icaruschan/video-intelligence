@@ -1,0 +1,3 @@
+google-genai>=1.64.0
+reportlab>=4.0
+pypdf>=5.0

@@ -1,0 +1,25 @@
+.venv/
+venv/
+ENV/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.env
+.env.*
+!.env.example
+
+# Media & outputs
+output/
+tmp/
+media/
+*.mp4
+*.mov
+*.webm
+*.avi
+*.mkv
+
+# OS artifacts
+.DS_Store
+Thumbs.db
