@@ -19,6 +19,11 @@ media/
 *.webm
 *.avi
 *.mkv
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.flac
 
 # OS artifacts
 .DS_Store

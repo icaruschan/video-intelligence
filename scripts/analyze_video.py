@@ -133,7 +133,11 @@ def parse_args() -> argparse.Namespace:
     edit.add_argument("--no-timecode", action="store_true", help="Do not burn a timecode strip into the detail clip")
     edit.add_argument("--keep-detail-clip", action="store_true", help="Save the (timecoded) detail clip in the output dir")
     edit.add_argument("--allow-long", action="store_true", help="Allow clips over 90 s in edit mode (1 fps)")
-    edit.add_argument("--measure-only", action="store_true", help="Edit mode: only run local measurements (no API call)")
+    edit.add_argument("--measure-only", action="store_true",
+                      help="Edit mode: only local measurements (no API call): measured.json, frames.json, overlays/, brief.json")
+    edit.add_argument("--from-json", metavar="ANALYSIS_JSON",
+                      help="Edit mode: re-measure the video and rebuild report.md/brief.json from a saved analysis.json (no API call)")
+    edit.add_argument("--no-frames", action="store_true", help="Skip frame measurements (overlays, entry timing, stills)")
     return parser.parse_args()
 
 
@@ -195,7 +199,9 @@ def write_outputs(out_dir: Path, report: str, data: dict | None) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "report.md").write_text(report)
     if data is not None:
-        (out_dir / "analysis.json").write_text(json.dumps(data, indent=2, ensure_ascii=False))
+        (out_dir / "analysis.json").write_text(json.dumps(data, indent=2, ensure_ascii=False, default=float))
+        if data.get("brief"):
+            (out_dir / "brief.json").write_text(json.dumps(data["brief"], indent=2, ensure_ascii=False, default=float))
     print(f"[info] Wrote {out_dir / 'report.md'}" + (f" and {out_dir / 'analysis.json'}" if data is not None else ""), file=sys.stderr)
 
 
@@ -207,14 +213,31 @@ def main() -> None:
         fail("--timeout must be greater than zero.")
     path = validate_video(args.video_path)
 
+    if args.mode == "edit" and args.from_json:
+        import edit_measure
+        import edit_mode
+        result, report = edit_mode.rerender_from_json(args, path, Path(args.from_json), edit_measure)
+        out_dir = Path(args.out) if args.out else Path("output") / (path.stem + "-rerender")
+        write_outputs(out_dir, report, result)
+        print(report)
+        print("[info] Model requests this run: 0 (offline re-render)", file=sys.stderr)
+        return
+
     if args.mode == "edit" and args.measure_only:
         import edit_measure
+        import edit_mode
         data = edit_measure.measure(path, threshold=args.scene_threshold, detail_window=args.detail_window,
                                     detail_target=args.detail_target)
         out_dir = Path(args.out) if args.out else Path("output") / path.stem
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "measured.json").write_text(json.dumps(data, indent=2))
+        res = {"measured": data}
+        edit_mode.postprocess(res, path, out_dir, frames=not args.no_frames)
+        if res.get("frames"):
+            (out_dir / "frames.json").write_text(json.dumps(res["frames"], indent=2, default=float))
+        (out_dir / "brief.json").write_text(json.dumps(res["brief"], indent=2, ensure_ascii=False, default=float))
         print(json.dumps(data, indent=2))
+        print(f"[info] Wrote measured.json, frames.json, brief.json (measured-only) in {out_dir}", file=sys.stderr)
         return
 
     client = None

@@ -62,7 +62,7 @@ bash install_skill.sh claude
 | **`general`** (Default) | Objective video breakdown | Summary, Timeline beats, Audio/Dialogue transcript, Confirmed visual elements, Notable moments. |
 | **`creative`** | UGC, ads, and creator teardowns | Beat map, Audio transcript, Hook, Audience, Angle, Tension, Payoff, CTA, Reusable patterns. |
 | **`repurpose`** | Content recycling & formatting | Content inventory, Audio transcript, 5–8 Timestamped clip & format opportunities. |
-| **`edit`** | Recreate a reference's look & feel | Measured cuts/shots/loudness/onsets/palette + 13-section craft spec (pacing, framing, B-roll, type, captions, motion, elements, transitions, colour, sound, retention, edit brief) as `report.md` + `analysis.json`. |
+| **`edit`** | Recreate a reference's look & feel | Measured cuts/shots/loudness/onsets/palette + frame-measured entries/overlays + 13-section craft spec as `report.md` + `analysis.json`, and a build-ready `brief.json` (style recipe, beat map, GSAP eases, px at 1080×1920, fonts, assets, QA ranges, cooked style.json fields). |
 
 ---
 
@@ -84,6 +84,10 @@ python scripts/analyze_video.py path/to/video.mp4 --fps 2
 # Edit / craft analysis of a short-form reference (ffmpeg + numpy required)
 python scripts/analyze_video.py path/to/reference.mp4 --mode edit            # -> output/reference/
 python scripts/analyze_video.py path/to/reference.mp4 --mode edit --measure-only   # local numbers only, no API
+                                    # -> measured.json, frames.json, brief.json, overlays/
+# Re-render an earlier edit run with the current brief/frames code: 0 model calls
+python scripts/analyze_video.py path/to/reference.mp4 --mode edit --from-json output/reference/analysis.json --out output/reference-v2
+# (--no-frames skips the frame measurements; scripts/selftest_edit.py runs offline checks)
 
 # Force the OpenRouter backup (e.g. Gemini daily quota used up)
 python3 scripts/analyze_video.py ref.mp4 --mode edit --provider openrouter
@@ -113,6 +117,16 @@ python scripts/analyze_video.py path/to/video.mp4 --prompt "What pricing plan is
    output uses `response_format: json_schema` (falls back to JSON-in-prompt + tolerant parsing). OpenRouter has no fps
    control, so pass 2 sends the timecoded detail clip slowed down `--openrouter-slowmo 4`× (strip still shows real
    source time) so the model's own ~2 fps sampling sees ~8 fps of source time.
+
+7. **Frames** (`scripts/edit_frames.py`, local numpy): element entry durations in frames/ms, staggered builds,
+   overshoot → `back.out(s)`, travel → px + fitted GSAP ease; persistent overlays (bbox, time span, crop still);
+   in-place builds (timer/counter pills, word builds).
+8. **Brief** (`scripts/edit_brief.py`): style recipe (cut-rate band, shot p25/p50/p75, captions, emphasis,
+   transitions, colour), beat map in % of runtime with one still per beat (`beats/`), contradictions reconciled
+   (detail pass wins inside its window; every value carries its source), sound honesty (no "no SFX" unless measured),
+   VO wpm / pauses / cuts vs words, fonts mapped to free installed equivalents with licence, assets (study-only),
+   do-not list tagged `[core-style]` / `[ref-specific]`, QA checklist as ranges, and a `cooked` block with
+   style.json field names. Workflow and field mapping: [`docs/EDIT_BRIEF.md`](docs/EDIT_BRIEF.md).
 
 Sound timing is the weak spot (no agent can truly listen yet); `edit_measure.py` has an `earshot` hook for a future sound-event timeline.
 

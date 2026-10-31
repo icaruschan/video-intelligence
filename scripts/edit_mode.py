@@ -123,9 +123,11 @@ EDIT_SCHEMA = _obj({
     "retention_devices": _arr({"t_s": N, "device": S, "description": S, "basis": B}),
     "cut_reconciliation": _arr({"measured_t_s": N, "what_happens": S, "is_real_cut": {"type": "string", "enum": ["yes", "no", "unclear"]}}),
     "missed_by_measurement": _arr({"t_s": N, "event": S}),
+    "assets": _arr({"item": S, "category": {"type": "string", "enum": ["broll", "prop", "graphic", "texture", "sound", "other"]},
+                    "how_to_get": S, "basis": B}),
     "edit_brief": _obj({
         "copy_values": _arr({"parameter": S, "value": S, "basis": B}),
-        "do_not": {"type": "array", "items": S},
+        "do_not": _arr({"rule": S, "scope": {"type": "string", "enum": ["core-style", "ref-specific"]}}),
         "checklist": {"type": "array", "items": S},
     }),
 })
@@ -154,6 +156,9 @@ GROUNDING = """Rules:
    - inference: interpretation of intent, feel, purpose or strategy
    - unclear: you cannot tell
 6. Font names are always guesses: write them as 'looks like X (or similar geometric sans)' with basis estimated.
+7. Sound honesty: you cannot reliably separate sound effects from voice and music. Never write that SFX are absent,
+   unnecessary or should be avoided unless you clearly hear that the track has none; if you cannot separate them,
+   say 'unclear'. Onsets are any transient (speech, music or SFX), not SFX.
 """
 
 EDIT_PROMPT = """You are a senior short-form video editor and motion designer reverse-engineering a REFERENCE video
@@ -186,7 +191,10 @@ Section guidance (be specific; numbers + units; seconds as decimals; durations i
 - colour: palette as roles (background, primary text, accent, highlight, secondary) with hex estimates (MEASURED palette is whole-frame dominant colours; use it to anchor hexes), grade (contrast, warmth, saturation), texture/grain.
 - sound_design: music energy/genre feel, ducking under voice, SFX per visual event (whoosh on transition, pop on caption ...), level vs voice, sync to cuts.
 - retention_devices: pattern interrupts, open loops, callbacks, progress cues, payoff timing.
-- edit_brief: the exact values Scott should copy (fps, cut rhythm, caption spec, ease curves, durations, colours, sizes), a do_not list, and a QA checklist.
+- assets: B-roll categories, props, textures and graphic elements someone must source or build to make a video in this style (the reference itself is study-only).
+- edit_brief: the exact values Scott should copy (fps, cut rhythm, caption spec, ease curves, durations, colours, sizes), a do_not list
+  (each rule tagged scope core-style = portable style rule, or ref-specific = only true of this video's content), and a QA checklist
+  written as ranges/ratios (e.g. 'median shot 0.6-0.9 s'), never absolute counts copied from the reference.
 
 Depth requirements (only where the video supports it; never pad with invented detail):
 - Every section's 'spec' array must contain ONE row for EVERY allowed slot name: give a concrete value with units, or 'unclear' (basis unclear). Never leave it vague
@@ -549,6 +557,9 @@ def render_report(path: Path, result: dict) -> str:
     L.append("## 11. Sound design\n")
     L.append("> Agents cannot hear precisely; SFX labels come from the model, timing anchors from measured onsets. "
              "earshot will replace this section's timing once enabled.\n")
+    if result.get("brief", {}).get("sound", {}).get("removed_claims"):
+        L.append("> **Sound honesty:** the model claims below that SFX are absent/unneeded are NOT measured (offline analysis "
+                 "cannot separate SFX from VO/music). Treat SFX as **unclear**; house style is SFX throughout. See 13a.\n")
     L.append(f"- Music: {sd.get('music')}\n- Ducking: {sd.get('ducking')}\n")
     L.append(_table(sd.get("sfx_events", []), [("t_s", "When"), ("sound", "Sound"), ("linked_visual_event", "Visual event"),
                                                ("level_vs_voice", "Level vs voice"), ("basis", "Basis")], ("t_s",)))
@@ -558,12 +569,25 @@ def render_report(path: Path, result: dict) -> str:
     L.append(_table(a.get("retention_devices", []), [("t_s", "When"), ("device", "Device"), ("description", "Description"), ("basis", "Basis")], ("t_s",)))
 
     eb = a.get("edit_brief", {})
+    if result.get("brief"):
+        import edit_brief
+        L.append(edit_brief.render_brief_md(result["brief"]))
+        eb = None
+    if eb is not None:
+        _old_brief(L, eb)
+
+    return _appendix(L, a, rc, result)
+
+
+def _old_brief(L: list, eb: dict) -> None:
     L.append("## 13. Edit brief for Scott\n")
     L.append("### Values to copy\n")
     L.append(_table(eb.get("copy_values", []), [("parameter", "Parameter"), ("value", "Value"), ("basis", "Basis")]))
-    L.append("### Do not\n" + "\n".join(f"- {x}" for x in eb.get("do_not", [])) + "\n")
+    L.append("### Do not\n" + "\n".join(f"- {x if isinstance(x, str) else x.get('rule')}" for x in eb.get("do_not", [])) + "\n")
     L.append("### QA checklist\n" + "\n".join(f"- [ ] {x}" for x in eb.get("checklist", [])) + "\n")
 
+
+def _appendix(L: list, a: dict, rc: dict, result: dict) -> str:
     L.append("## Appendix: measured vs model reconciliation\n")
     if rc:
         L.append(f"- Model transition/B-roll times checked: {rc['model_event_times_checked']}, within ±{rc['tolerance_s']} s of a measured cut: "
@@ -582,6 +606,47 @@ def render_report(path: Path, result: dict) -> str:
 
 
 # ----------------------------------------------------------------------------- orchestration
+
+def postprocess(result: dict, path: Path, out_dir: Path, frames: bool = True) -> None:
+    """Deterministic, offline: frame measurements (overlays, in-place builds, entry timing) + build-ready brief.
+    Writes stills into out_dir/overlays and out_dir/beats. Never calls a model."""
+    import edit_brief
+    import edit_frames
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fr = None
+    if frames:
+        print("[info] Frame measurements (overlays, in-place builds, entry timing)...", file=sys.stderr)
+        try:
+            fr = edit_frames.run_frames(path, result["measured"], out_dir)
+            result["frames"] = fr
+        except Exception as error:  # best effort, never blocks the report
+            result["frames_error"] = str(error)[:500]
+            print(f"[warning] Frame measurements failed: {error}", file=sys.stderr)
+    result["brief"] = edit_brief.build_brief(result["measured"], result.get("analysis") or {}, result.get("detail_pass"),
+                                             fr, out_dir=out_dir, video=path, frames_mod=edit_frames)
+
+
+def rerender_from_json(args, path: Path, saved_json: Path, measure_mod) -> tuple[dict, str]:
+    """Re-measure the video locally and rebuild report/brief from a SAVED analysis.json (no model calls)."""
+    saved = json.loads(saved_json.read_text())
+    measured = measure_mod.measure(path, threshold=args.scene_threshold, detail_window=args.detail_window,
+                                   detail_target=args.detail_target)
+    run = dict(saved.get("run", {}))
+    run.update({"re_rendered_from": str(saved_json), "re_rendered_at": time.strftime("%Y-%m-%d %H:%M %Z"),
+                "note": "model output reused from the saved run; measurements and brief recomputed offline; 0 model requests"})
+    run["requests"] = {"total_requests": 0, "per_provider": {}, "this_render": "offline"}
+    result = {"run": run, "measured": measured, "measured_prompt_block": measure_mod.compact_for_prompt(measured)}
+    for k in ("analysis", "detail_pass", "detail_error", "error"):
+        if k in saved:
+            result[k] = saved[k]
+    if result.get("analysis"):
+        result["missing_spec_slots"] = fill_missing_slots(result["analysis"])
+        result["basis_audit"] = audit_basis(result["measured_prompt_block"], result["analysis"])
+        result["reconciliation"] = reconcile(measured, result["analysis"])
+    out_dir = Path(args.out) if args.out else Path("output") / (path.stem + "-rerender")
+    postprocess(result, path, out_dir, frames=not getattr(args, "no_frames", False))
+    return result, render_report(path, result)
+
 
 def run_edit_mode(args, chain, path: Path, measure_mod) -> tuple[dict, str]:
     print("[info] Measuring locally (ffprobe / scene detection / loudness / onsets / palette)...", file=sys.stderr)
@@ -685,5 +750,7 @@ def run_edit_mode(args, chain, path: Path, measure_mod) -> tuple[dict, str]:
         result["error"] = str(error)[:1000]
         print(f"[error] {error}", file=sys.stderr)
     result["run"]["requests"] = chain.stats.summary()
+    out_dir = Path(args.out) if args.out else Path("output") / path.stem
+    postprocess(result, path, out_dir, frames=not getattr(args, "no_frames", False))
     report = render_report(path, result)
     return result, report

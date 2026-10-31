@@ -61,8 +61,16 @@ python scripts\analyze_video.py <path\to\video.mp4> --mode creative
      the frame, for frame-level motion timing (durations, easing, overshoot, stagger, caption word timing).
    - Every number is labelled `measured` / `measured timing` / `estimated` / `inference` / `unclear`; model
      claims of "measured" that are not in the measured data are downgraded automatically.
-   - Writes `report.md` + `analysis.json` to `--out` (default `./output/<video-stem>/`). Short-form only by default
-     (≤ 90 s; `--allow-long` to override).
+   - Frame measurements (local): entry durations in frames/ms, staggered builds, overshoot → `back.out(s)`, travel
+     → px + GSAP ease, persistent overlays with bbox/time span/crop still, in-place builds (timer pills, counters).
+   - Writes `report.md` + `analysis.json` + `brief.json` + `beats/` (one still per beat) + `overlays/` to `--out`
+     (default `./output/<video-stem>/`). Short-form only by default (≤ 90 s; `--allow-long` to override).
+   - Section 13 = the build brief: 13a style recipe, 13b beat map (% runtime), 13c measured timing → GSAP,
+     13d overlays, 13e VO pace and cuts vs words, 13f values to copy, 13g fonts (free, installed, licence),
+     13h assets (study-only), 13i do-not `[core-style]`/`[ref-specific]`, 13j QA ranges; contradictions listed with
+     the winner. Field mapping to cooked style.json / HyperFrames: `docs/EDIT_BRIEF.md`.
+   - Workflow: reference → edit-mode analysis → brief → storyboard check with Fortune → build in
+     HyperFrames/cooked → run edit mode on the render and tick the QA list.
 
 ## Supported Flags
 
@@ -77,7 +85,9 @@ python scripts\analyze_video.py <path\to\video.mp4> --mode creative
 Edit-mode flags: `--scene-threshold 0.3` (hard-cut score), `--detail-window 6`, `--detail-fps 10`,
 `--detail-target motion|cuts`, `--detail-start S`, `--no-detail`, `--no-timecode`, `--keep-detail-clip`,
 `--fallback-model <gemini-model>` (optional second Gemini model, off by default), `--openrouter-slowmo 4`,
-`--allow-long`, `--measure-only` (no API call; writes `measured.json`).
+`--allow-long`, `--measure-only` (no API call; writes `measured.json`, `frames.json`, `brief.json`, `overlays/`),
+`--from-json <analysis.json>` (re-render report/brief from a saved run, 0 model calls), `--no-frames`.
+Offline checks: `python scripts/selftest_edit.py`.
 
 Provider flags (all modes): `--provider auto|gemini|openrouter` (default `auto`), `--openrouter-model <id>`,
 `--no-audio-part`. Max 2 model requests per pass per provider, then fall over; the request count and OpenRouter
@@ -96,5 +106,7 @@ Cost per edit run on a 42 s clip (2 requests):
 - In `creative` mode, strictly distinguish verified direct observations from strategic interpretations.
 - In `edit` mode, measured data beats model perception: cut times, shot lengths, loudness and onsets come from
   ffmpeg/numpy; the model explains each measured cut and lists cuts it thinks measurement missed.
+- Never write "no SFX needed" unless measured; SFX that cannot be separated from music/voice are `unclear`
+  (house style: SFX throughout).
 - Sound design timing is rough (onsets cannot tell SFX from speech/music). TODO: merge earshot's sound-event
   timeline at the `earshot` hook in `scripts/edit_measure.py` once enabled.
