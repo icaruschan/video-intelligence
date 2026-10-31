@@ -215,18 +215,19 @@ def loudness(path: Path) -> dict:
                     out[name] = float(line.split()[1])
                 except (IndexError, ValueError):
                     pass
-    # Short-term loudness per ~0.5s for a coarse energy curve
+    # Momentary loudness (400 ms window) per ~0.5s for an energy curve. (Short-term S uses a 3 s window and reads
+    # -120 LUFS for the first 3 s of every file, which models mistook for silence.)
     curve = []
     for line in text.splitlines():
-        if "Parsed_ebur128" in line and " t:" in line and " S:" in line:
+        if "Parsed_ebur128" in line and " t:" in line and " M:" in line:
             try:
                 t = float(line.split(" t:")[1].split()[0])
-                s = float(line.split(" S:")[1].split()[0])
-                if abs(t * 2 - round(t * 2)) < 0.051:
-                    curve.append({"t": round(t, 1), "short_term_lufs": s})
+                s = float(line.split(" M:")[1].split()[0])
+                if t >= 0.4 and abs(t * 2 - round(t * 2)) < 0.051:
+                    curve.append({"t": round(t, 1), "momentary_lufs": s})
             except (IndexError, ValueError):
                 continue
-    out["short_term_curve_0p5s"] = curve
+    out["momentary_curve_0p5s"] = curve
     return out
 
 
@@ -412,8 +413,8 @@ def compact_for_prompt(m: dict, max_onsets: int = 60) -> dict:
     c["cuts"]["shots"] = [[s["start"], s["dur"]] for s in c["cuts"]["shots"]]
     c["visual_change_per_sec"] = [[v["t"], v["energy"]] for v in c.get("visual_change_per_sec", [])]
     if "loudness" in c:
-        c["loudness"]["short_term_curve_1s"] = [[p["t"], p["short_term_lufs"]] for p in
-                                                 c["loudness"].pop("short_term_curve_0p5s", []) if float(p["t"]).is_integer()]
+        c["loudness"]["momentary_curve_1s"] = [[p["t"], p["momentary_lufs"]] for p in
+                                                 c["loudness"].pop("momentary_curve_0p5s", []) if float(p["t"]).is_integer()]
     if c.get("onsets", {}).get("events"):
         strongest = sorted(c["onsets"]["events"], key=lambda e: -e["strength"])[:max_onsets]
         c["onsets"]["events"] = [[e["t"], e["strength"]] for e in sorted(strongest, key=lambda e: e["t"])]

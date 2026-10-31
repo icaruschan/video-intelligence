@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze a local video with Gemini and print a grounded Markdown report.
+"""Analyze a local video with Gemini (or OpenRouter as backup) and print a grounded Markdown report.
 
 Modes: general / creative / repurpose (Markdown) and edit (measured + structured craft spec:
 analysis.json + report.md; see scripts/edit_mode.py)."""
@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import providers  # noqa: E402
 
 try:
     from google import genai
@@ -109,13 +111,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model ID (default: {DEFAULT_MODEL})")
     parser.add_argument("--timeout", type=int, default=300, help="Files API processing timeout in seconds")
     parser.add_argument("--keep-upload", action="store_true", help="Do not delete an uploaded Gemini file")
+    parser.add_argument("--provider", choices=["auto", "gemini", "openrouter"], default="auto",
+                        help="auto (default): Gemini first, then OpenRouter on daily quota / repeated 503 / disconnects")
+    parser.add_argument("--openrouter-model", default=providers.DEFAULT_OPENROUTER_MODEL,
+                        help=f"OpenRouter model (default: {providers.DEFAULT_OPENROUTER_MODEL}); needs OPENROUTER_API_KEY")
+    parser.add_argument("--no-audio-part", action="store_true",
+                        help="OpenRouter: do not attach the soundtrack as a separate audio input")
     parser.add_argument("--out", help="Output directory (edit mode default: ./output/<video-stem>/; other modes: print only)")
     edit = parser.add_argument_group("edit mode")
     edit.add_argument("--scene-threshold", type=float, default=0.3, help="ffmpeg scene score for a hard cut (default 0.3)")
     edit.add_argument("--detail-window", type=float, default=6.0, help="Seconds for the dense-cut detail pass (default 6)")
     edit.add_argument("--detail-fps", type=float, default=10.0, help="fps for the detail pass (default 10, capped at source fps)")
-    edit.add_argument("--fallback-model", default="gemini-flash-latest",
-                      help="Model to try if --model stays overloaded (503/429) after retries; '' to disable")
+    edit.add_argument("--fallback-model", default="",
+                      help="Optional second Gemini model tried before OpenRouter (own daily quota). Off by default")
+    edit.add_argument("--openrouter-slowmo", type=float, default=4.0,
+                      help="OpenRouter detail pass: slow the timecoded clip this many times so the model samples it densely (default 4; 1 = off)")
     edit.add_argument("--no-detail", action="store_true", help="Skip the second, high-fps detail pass")
     edit.add_argument("--detail-target", choices=["motion", "cuts"], default="motion",
                       help="Detail window: most within-shot motion (default) or most cuts")
@@ -207,57 +217,54 @@ def main() -> None:
         print(json.dumps(data, indent=2))
         return
 
-    if genai is None or types is None:
-        fail("Missing dependency: google-genai. Install it with: python3 -m pip install google-genai")
-    if not os.getenv("GEMINI_API_KEY"):
-        fail("GEMINI_API_KEY is not set. Create a key at https://aistudio.google.com/apikey and export it in your shell.")
+    client = None
+    if args.provider in ("auto", "gemini"):
+        if genai is None or types is None:
+            if args.provider == "gemini":
+                fail("Missing dependency: google-genai. Install it with: python3 -m pip install google-genai")
+        elif os.getenv("GEMINI_API_KEY"):
+            client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        elif args.provider == "gemini":
+            fail("GEMINI_API_KEY is not set. Create a key at https://aistudio.google.com/apikey and export it in your shell.")
+    if args.provider == "openrouter" and not os.getenv("OPENROUTER_API_KEY"):
+        fail("OPENROUTER_API_KEY is not set.")
 
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    stats = providers.RunStats()
+    chain = providers.build_chain(args, stats, make_gemini_part=lambda p, fps: video_part(client, p, fps, args.timeout),
+                                  gemini_client=client, gemini_types=types)
+    if not chain.providers:
+        fail("No provider available: set GEMINI_API_KEY and/or OPENROUTER_API_KEY.")
+    print(f"[info] Provider order: {' -> '.join(chain.names)}", file=sys.stderr)
 
-    if args.mode == "edit":
-        import edit_measure
-        import edit_mode
-        uploads: list[str] = []
-        try:
-            result, report = edit_mode.run_edit_mode(
-                args, client, types, path,
-                lambda p, fps: video_part(client, p, fps, args.timeout), edit_measure)
-            uploads = result.pop("_uploads", [])
-        finally:
-            if not args.keep_upload:
-                for name in uploads:
-                    try:
-                        client.files.delete(name=name)
-                        print("[info] Deleted temporary Gemini upload.", file=sys.stderr)
-                    except Exception as error:
-                        print(f"[warning] Could not delete temporary upload: {error}", file=sys.stderr)
-        out_dir = Path(args.out) if args.out else Path("output") / path.stem
-        write_outputs(out_dir, report, result)
-        print(report)
-        if result.get("error"):
-            raise SystemExit(2)
-        return
-
-    uploaded_name = None
     try:
-        part, uploaded_name = video_part(client, path, args.fps, args.timeout)
-        print(f"[info] Analyzing with {args.model} in {args.mode} mode...", file=sys.stderr)
-        response = client.models.generate_content(
-            model=args.model,
-            contents=types.Content(parts=[part, types.Part(text=build_prompt(args.mode, args.prompt))]),
-        )
-        text = response.text or "(Gemini returned no text.)"
+        if args.mode == "edit":
+            import edit_measure
+            import edit_mode
+            result, report = edit_mode.run_edit_mode(args, chain, path, edit_measure)
+            out_dir = Path(args.out) if args.out else Path("output") / path.stem
+            write_outputs(out_dir, report, result)
+            print(report)
+            _log_requests(stats)
+            if result.get("error"):
+                raise SystemExit(2)
+            return
+
+        prompt = build_prompt(args.mode, args.prompt)
+        print(f"[info] Analyzing in {args.mode} mode...", file=sys.stderr)
+        text, info = chain.generate(args.mode, None, lambda p: {"video": path, "fps": args.fps, "prompt": prompt})
+        text = text or "(model returned no text.)"
         print(text)
         if args.out:
-            write_outputs(Path(args.out), text, None)
+            write_outputs(Path(args.out), text + f"\n\n---\nAnswered by {info['provider']}:{info['model']}\n", None)
+        _log_requests(stats)
     finally:
-        if uploaded_name and not args.keep_upload:
-            try:
-                client.files.delete(name=uploaded_name)
-                print("[info] Deleted temporary Gemini upload.", file=sys.stderr)
-            except Exception as error:  # Cleanup must not hide the analysis result.
-                print(f"[warning] Could not delete temporary upload: {error}", file=sys.stderr)
+        chain.cleanup(keep=args.keep_upload)
 
+
+def _log_requests(stats) -> None:
+    s = stats.summary()
+    cost = f", OpenRouter cost ${s['openrouter_cost_usd']:.4f}" if s["openrouter_cost_usd"] else ""
+    print(f"[info] Model requests this run: {s['total_requests']} {s['per_provider']}{cost}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

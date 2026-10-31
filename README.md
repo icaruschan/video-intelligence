@@ -26,6 +26,11 @@ export GEMINI_API_KEY="your-gemini-api-key"
 ```
 *(Get a free key from [Google AI Studio](https://aistudio.google.com/apikey). You can also add this line to `/workspace/.bashrc` so it persists across sessions).*
 
+Optional backup provider (recommended: the Gemini free tier allows only ~20 requests/day per model):
+```bash
+export OPENROUTER_API_KEY="your-openrouter-key"   # used for qwen/qwen3.8-omni-flash by default
+```
+
 ### Step 3: Tell Grok Bot How to Use It
 Paste this prompt into Grok Bot:
 > *"You now have the **Video Intelligence** tool installed in `/workspace/video-intelligence`. Read `/workspace/video-intelligence/SKILL.md`. Whenever I give you a video or ask you to watch, analyze, deconstruct, or repurpose a video, run:*
@@ -80,6 +85,9 @@ python scripts/analyze_video.py path/to/video.mp4 --fps 2
 python scripts/analyze_video.py path/to/reference.mp4 --mode edit            # -> output/reference/
 python scripts/analyze_video.py path/to/reference.mp4 --mode edit --measure-only   # local numbers only, no API
 
+# Force the OpenRouter backup (e.g. Gemini daily quota used up)
+python3 scripts/analyze_video.py ref.mp4 --mode edit --provider openrouter
+
 # Save any mode's report to a folder
 python scripts/analyze_video.py path/to/video.mp4 --mode creative --out output/my-video
 
@@ -95,7 +103,16 @@ python scripts/analyze_video.py path/to/video.mp4 --prompt "What pricing plan is
 2. **Pass 1** (`scripts/edit_mode.py`): whole clip at 5/3/2 fps (≤30/≤60/≤90 s) with the measurements in the prompt, structured JSON via `response_json_schema` (falls back to JSON mode + tolerant parsing). Required spec slots per section so nothing comes back empty.
 3. **Pass 2**: the window with the most within-shot motion, re-encoded with an absolute timecode strip under the frame, at ~10 fps, for frame-level motion timing.
 4. **Audit**: model "measured" labels not backed by the measured data are downgraded; model event times are reconciled against measured cuts.
-5. Transient 429/503 errors back off exponentially; a fallback model is tried if the main one stays overloaded.
+5. **Providers** (`scripts/providers.py`, `--provider auto|gemini|openrouter`, default `auto`): Gemini first, then OpenRouter
+   (`--openrouter-model`, default `qwen/qwen3.8-omni-flash`) on a daily-quota 429, repeated 503s or disconnects.
+   Hard cap: at most 2 model requests per pass per provider; a provider that hit its daily quota is skipped for the
+   rest of the run, and one that gave up on 503s gets a single probe on the next pass. Every request is counted and
+   logged (`[req #n]`) and summarised in `analysis.json → run.requests`, including the OpenRouter cost in USD.
+6. **OpenRouter specifics:** the video goes as a base64 `video_url` data URL (re-encoded only if > 12 MB or long edge
+   > 1280 px), the soundtrack is also attached as an `input_audio` mp3 (`--no-audio-part` to skip), and structured
+   output uses `response_format: json_schema` (falls back to JSON-in-prompt + tolerant parsing). OpenRouter has no fps
+   control, so pass 2 sends the timecoded detail clip slowed down `--openrouter-slowmo 4`× (strip still shows real
+   source time) so the model's own ~2 fps sampling sees ~8 fps of source time.
 
 Sound timing is the weak spot (no agent can truly listen yet); `edit_measure.py` has an `earshot` hook for a future sound-event timeline.
 

@@ -232,81 +232,7 @@ def default_edit_fps(duration: float) -> float:
     return 1
 
 
-def parse_json_loose(text: str):
-    text = (text or "").strip()
-    if not text:
-        raise ValueError("empty response")
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
-    if fenced:
-        return json.loads(fenced.group(1))
-    start, end = text.find("{"), text.rfind("}")
-    if start != -1 and end > start:
-        return json.loads(text[start:end + 1])
-    raise ValueError("no JSON object found")
-
-
-def usage_dict(response) -> dict:
-    u = getattr(response, "usage_metadata", None)
-    if not u:
-        return {}
-    out = {}
-    for k in ("prompt_token_count", "candidates_token_count", "thoughts_token_count", "total_token_count"):
-        v = getattr(u, k, None)
-        if v is not None:
-            out[k] = v
-    details = getattr(u, "prompt_tokens_details", None) or []
-    for d in details:
-        mod = getattr(getattr(d, "modality", None), "name", str(getattr(d, "modality", "")))
-        out[f"prompt_{mod.lower()}_tokens"] = getattr(d, "token_count", None)
-    return out
-
-
-TRANSIENT = ("Server disconnected", "RemoteProtocolError", "ReadTimeout", "429", "500", "502", "503", "504", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "DEADLINE_EXCEEDED", "overloaded")
-
-
-def generate_json(client, types, model: str, parts: list, schema: dict, label: str, retries: int = 2,
-                  transient_retries: int = 5):
-    """Structured output with response_json_schema; fall back to plain JSON mode + loose parse.
-    Transient API errors (429/5xx, 'high demand') back off exponentially without burning a config."""
-    attempts = [
-        ("schema", types.GenerateContentConfig(response_mime_type="application/json", response_json_schema=schema,
-                                               temperature=0.2)),
-        ("json-mime", types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)),
-    ]
-    last_error = None
-    usage_total: list[dict] = []
-    for name, config in attempts:
-        parse_failures = transient = 0
-        while parse_failures < retries and transient <= transient_retries:
-            try:
-                print(f"[info] {label}: requesting structured JSON ({name})...", file=sys.stderr)
-                resp = client.models.generate_content(model=model, contents=types.Content(parts=parts), config=config)
-                usage_total.append(usage_dict(resp))
-                return parse_json_loose(resp.text), {"config": name, "calls": len(usage_total), "usage": usage_total}
-            except ValueError as error:  # JSON parse problem -> retry same config
-                last_error = error
-                parse_failures += 1
-                print(f"[warning] {label}: could not parse JSON ({error}); retrying", file=sys.stderr)
-            except Exception as error:
-                last_error = error
-                msg = str(error)
-                if "PerDay" in msg or "per day" in msg.lower():
-                    raise RuntimeError(f"{label}: daily Gemini quota exhausted; try tomorrow or use a paid key") from error
-                if any(code in msg for code in TRANSIENT):
-                    transient += 1
-                    wait = min(10 * 2 ** (transient - 1), 90)
-                    print(f"[warning] {label}: transient API error ({msg[:80]}...); waiting {wait}s", file=sys.stderr)
-                    time.sleep(wait)
-                    continue
-                print(f"[warning] {label}: API rejected request ({msg[:300]}); trying next config", file=sys.stderr)
-                break  # e.g. schema rejected -> next config
-        if transient > transient_retries:
-            break  # service unavailable; switching config will not help
-    raise RuntimeError(f"{label} failed: {str(last_error)[:300]}")
+from providers import parse_json_loose  # noqa: E402,F401  (re-exported for callers)
 
 
 def _font_file() -> str | None:
@@ -317,40 +243,31 @@ def _font_file() -> str | None:
         return None
 
 
-def generate_json_with_fallback(client, types, args, parts, schema, label):
-    try:
-        return generate_json(client, types, args.model, parts, schema, label)
-    except RuntimeError as error:
-        fb = getattr(args, "fallback_model", None)
-        daily = "daily Gemini quota" in str(error)
-        if not fb or fb == args.model or not (daily or any(c in str(error) for c in TRANSIENT)):
-            raise
-        why = "daily free-tier quota used up (quotas are per model)" if daily else "overloaded"
-        print(f"[warning] {label}: {args.model} {why}; falling back to {fb}", file=sys.stderr)
-        data, info = generate_json(client, types, fb, parts, schema, f"{label} (fallback {fb})")
-        info["model"] = fb
-        return data, info
-
-
-def cut_segment(path: Path, start: float, end: float, out_dir: Path, timecode: bool = True) -> Path:
+def cut_segment(path: Path, start: float, end: float, out_dir: Path, timecode: bool = True, slowmo: float = 1.0) -> Path:
     """Accurate re-encoded segment. With timecode=True, pads a black strip under the frame and burns the
     ABSOLUTE source time + frame number into it (original pixels untouched), so the model reads time instead
     of estimating it."""
-    out = out_dir / f"detail_{start:.2f}-{end:.2f}.mp4"
+    tag = f"_slow{slowmo:g}x" if slowmo > 1 else ""
+    out = out_dir / f"detail_{start:.2f}-{end:.2f}{tag}.mp4"
     vf = []
     font = _font_file() if timecode else None
     if timecode and font:
         vf = ["-vf", (f"pad=iw:ih+ih/14:0:0:black,drawtext=fontfile='{font}':fontcolor=white:fontsize=h/30:"
                       f"x=(w-tw)/2:y=h-(h/14)/2-th/2-th/4:"
                       f"text='t=%{{eif\\:trunc(t+{start:.3f})\\:d}}.%{{eif\\:mod((t+{start:.3f})*1000\\,1000)\\:d\\:3}}s  f=%{{frame_num}}'")]
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", str(path),
-           "-t", f"{end - start:.3f}", *vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-           "-c:a", "aac", "-b:a", "128k", str(out)]
+    if slowmo > 1:  # slow AFTER drawtext so the strip still shows real source time; audio dropped
+        vf = ["-vf", (vf[1] + "," if vf else "") + f"setpts={slowmo:g}*PTS"]
+        audio = ["-an"]
+    else:
+        audio = ["-c:a", "aac", "-b:a", "128k"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
+           "-i", str(path), *vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+           *audio, str(out)]
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if res.returncode != 0:
         if vf:  # timecode overlay failed (fonts/filters) -> plain segment
             print(f"[warning] timecode overlay failed ({res.stderr[:150]}); sending plain segment", file=sys.stderr)
-            return cut_segment(path, start, end, out_dir, timecode=False)
+            return cut_segment(path, start, end, out_dir, timecode=False, slowmo=slowmo)
         raise RuntimeError(f"ffmpeg segment cut failed: {res.stderr[:300]}")
     return out
 
@@ -514,8 +431,9 @@ def render_report(path: Path, result: dict) -> str:
     cuts = m["cuts"]
     L = []
     L.append(f"# Edit analysis: {path.name}\n")
-    fb = [v.get("model") for v in result["run"].get("usage", {}).values() if isinstance(v, dict) and v.get("model")]
-    L.append(f"Model: `{result['run']['model']}`" + (f" (fallback used: {', '.join(fb)})" if fb else "") + f" · pass-1 fps {result['run']['fps']} · generated {result['run']['generated_at']}  ")
+    ab = result["run"].get("answered_by") or {}
+    L.append(f"Providers: `{result['run']['model']}`" + (" · answered by " + ", ".join(f"{k}={v}" for k, v in ab.items()) if ab else "")
+             + f" · Gemini pass-1 fps {result['run']['fps']} · generated {result['run']['generated_at']}  ")
     L.append("Every number is tagged **measured** (ffmpeg/numpy on this file), **estimated** (model's visual/audio estimate), "
              "**inference** (interpretation) or **unclear**.\n")
 
@@ -656,13 +574,16 @@ def render_report(path: Path, result: dict) -> str:
                  (", ".join(f"{_fmt_t(e.get('t_s'))} {e.get('event')}" for e in rc['model_extra_events']) or "none") + "\n")
     L.append(_table(a.get("cut_reconciliation", []), [("measured_t_s", "Measured cut"), ("is_real_cut", "Real cut?"), ("what_happens", "What happens")], ("measured_t_s",)))
     u = result["run"].get("usage", {})
-    L.append(f"\n---\nAPI usage: {json.dumps(u)}\n")
+    rq = result["run"].get("requests") or {}
+    L.append(f"\n---\nModel requests this run: {rq.get('total_requests', '?')} {json.dumps(rq.get('per_provider', {}))}"
+             + (f" · OpenRouter cost ${rq['openrouter_cost_usd']:.4f}" if rq.get("openrouter_cost_usd") else ""))
+    L.append(f"\nAPI usage: {json.dumps(u)}\n")
     return "\n".join(L)
 
 
 # ----------------------------------------------------------------------------- orchestration
 
-def run_edit_mode(args, client, types, path: Path, make_video_part, measure_mod) -> tuple[dict, str]:
+def run_edit_mode(args, chain, path: Path, measure_mod) -> tuple[dict, str]:
     print("[info] Measuring locally (ffprobe / scene detection / loudness / onsets / palette)...", file=sys.stderr)
     measured = measure_mod.measure(path, threshold=args.scene_threshold, detail_window=args.detail_window,
                                    detail_target=args.detail_target)
@@ -682,20 +603,18 @@ def run_edit_mode(args, client, types, path: Path, make_video_part, measure_mod)
         prompt += f"\n\n## Additional user request\n{args.prompt}\n"
 
     result: dict = {
-        "run": {"mode": "edit", "model": args.model, "fps": fps, "video": str(path),
+        "run": {"mode": "edit", "model": " -> ".join(chain.names) or args.model, "fps": fps, "video": str(path),
                 "generated_at": time.strftime("%Y-%m-%d %H:%M %Z"), "usage": {}},
         "measured": measured,
         "measured_prompt_block": block,
     }
-    uploads: list[str] = []
     try:
-        part, up = make_video_part(path, fps)
-        if up:
-            uploads.append(up)
-        print(f"[info] Pass 1: whole clip at {fps} fps with {args.model}...", file=sys.stderr)
-        analysis, info = generate_json_with_fallback(client, types, args, [part, types.Part(text=prompt)], EDIT_SCHEMA, "pass 1")
+        print(f"[info] Pass 1: whole clip (Gemini at {fps} fps; OpenRouter model samples itself) via {' -> '.join(chain.names)}",
+              file=sys.stderr)
+        analysis, info = chain.generate("pass 1", EDIT_SCHEMA, lambda p: {"video": path, "fps": fps, "prompt": prompt})
         result["analysis"] = analysis
         result["run"]["usage"]["pass1"] = info
+        result["run"]["answered_by"] = {"pass1": f"{info['provider']}:{info['model']}"}
         result["missing_spec_slots"] = fill_missing_slots(analysis)
         result["basis_audit"] = audit_basis(block, analysis)
         result["reconciliation"] = reconcile(measured, analysis)
@@ -705,22 +624,39 @@ def run_edit_mode(args, client, types, path: Path, make_video_part, measure_mod)
             with tempfile.TemporaryDirectory() as tmp:
                 try:
                     seg = cut_segment(path, dw["start"], dw["end"], Path(tmp), timecode=not args.no_timecode)
+                    slow = max(1.0, args.openrouter_slowmo) if not args.no_timecode else 1.0
+                    seg_slow = cut_segment(path, dw["start"], dw["end"], Path(tmp), timecode=True, slowmo=slow) if slow > 1 else seg
                     if args.keep_detail_clip:
                         out_dir = Path(args.out) if args.out else Path("output") / path.stem
                         out_dir.mkdir(parents=True, exist_ok=True)
-                        (out_dir / seg.name).write_bytes(seg.read_bytes())
+                        for f in {seg, seg_slow}:
+                            (out_dir / f.name).write_bytes(f.read_bytes())
                     dfps = min(args.detail_fps, measured["media"]["fps"] or args.detail_fps)
                     in_win = [c["t"] for c in measured["cuts"]["hard_cuts"] if dw["start"] <= c["t"] < dw["end"]]
                     shots = [[max(sh["start"], dw["start"]), min(sh["end"], dw["end"])] for sh in measured["cuts"]["shots"]
                              if sh["end"] > dw["start"] and sh["start"] < dw["end"]]
-                    dprompt = DETAIL_PROMPT.format(length=dw["end"] - dw["start"], start=dw["start"], end=dw["end"], fps=dfps,
-                                                   grounding=GROUNDING, cuts=in_win or "none", shots=shots,
-                                                   frame_ms=1000 / dfps)
-                    dpart, dup = make_video_part(seg, dfps)
-                    if dup:
-                        uploads.append(dup)
-                    print(f"[info] Pass 2: detail window {dw['start']}-{dw['end']} s at {dfps} fps ({dw.get('target')})...", file=sys.stderr)
-                    detail, dinfo = generate_json_with_fallback(client, types, args, [dpart, types.Part(text=dprompt)], DETAIL_SCHEMA, "pass 2")
+
+                    def build_detail(p):
+                        if p.name == "openrouter":
+                            # no fps control on OpenRouter: send a slowed copy so the model's own sampling is denser
+                            eff = f"model-chosen (clip slowed {slow:g}x, so ~{2 * slow:g} fps of source time at ~2 fps sampling)"
+                            frame_ms = 1000 / (2 * slow)
+                            pr = DETAIL_PROMPT.format(length=dw["end"] - dw["start"], start=dw["start"], end=dw["end"], fps=eff,
+                                                      grounding=GROUNDING, cuts=in_win or "none", shots=shots, frame_ms=frame_ms)
+                            if slow > 1:
+                                pr = (f"NOTE: this clip plays at 1/{slow:g} speed (slow motion) so you see more frames. The playback clock "
+                                      "is NOT source time: always read the white strip (t=SS.sss) for times, and convert any duration you "
+                                      f"judge from playback by dividing by {slow:g}. It has no audio.\n\n") + pr
+                            return {"video": seg_slow, "fps": None, "prompt": pr, "audio": slow <= 1}
+                        pr = DETAIL_PROMPT.format(length=dw["end"] - dw["start"], start=dw["start"], end=dw["end"], fps=dfps,
+                                                  grounding=GROUNDING, cuts=in_win or "none", shots=shots, frame_ms=1000 / dfps)
+                        return {"video": seg, "fps": dfps, "prompt": pr}
+
+                    print(f"[info] Pass 2: detail window {dw['start']}-{dw['end']} s ({dw.get('target')})...", file=sys.stderr)
+                    detail, dinfo = chain.generate("pass 2", DETAIL_SCHEMA, build_detail)
+                    result["run"].setdefault("answered_by", {})["pass2"] = f"{dinfo['provider']}:{dinfo['model']}"
+                    if dinfo["provider"] == "openrouter" and slow > 1:
+                        dfps = f"~{2 * slow:g} effective (slowed {slow:g}x)"
                     # sanity: times must fall inside the window (model was asked for absolute seconds)
                     lo, hi = dw["start"] - 0.2, dw["end"] + 0.2
                     bad = [e for e in detail.get("events", []) if isinstance(e.get("t_start_s"), (int, float))
@@ -748,7 +684,6 @@ def run_edit_mode(args, client, types, path: Path, make_video_part, measure_mod)
     except Exception as error:
         result["error"] = str(error)[:1000]
         print(f"[error] {error}", file=sys.stderr)
-    finally:
-        result["_uploads"] = uploads
+    result["run"]["requests"] = chain.stats.summary()
     report = render_report(path, result)
     return result, report

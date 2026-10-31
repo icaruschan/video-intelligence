@@ -22,6 +22,8 @@ Analyze a local video using Gemini's native multimodal video understanding.
   ```bash
   export GEMINI_API_KEY="your-api-key"
   ```
+- Optional backup: `OPENROUTER_API_KEY` (OpenRouter, default model `qwen/qwen3.8-omni-flash`). With `--provider auto`
+  (default) Gemini is tried first and OpenRouter takes over on a daily-quota 429, repeated 503s or disconnects.
 
 ## How to Invoke
 
@@ -74,9 +76,17 @@ python scripts\analyze_video.py <path\to\video.mp4> --mode creative
 
 Edit-mode flags: `--scene-threshold 0.3` (hard-cut score), `--detail-window 6`, `--detail-fps 10`,
 `--detail-target motion|cuts`, `--detail-start S`, `--no-detail`, `--no-timecode`, `--keep-detail-clip`,
-`--fallback-model gemini-flash-latest`, `--allow-long`, `--measure-only` (no API call; writes `measured.json`).
+`--fallback-model <gemini-model>` (optional second Gemini model, off by default), `--openrouter-slowmo 4`,
+`--allow-long`, `--measure-only` (no API call; writes `measured.json`).
 
-Cost: a 40 s clip ≈ 21k tokens (pass 1) + ≈ 7k tokens (pass 2) on gemini-3.5-flash — two API calls per run.
+Provider flags (all modes): `--provider auto|gemini|openrouter` (default `auto`), `--openrouter-model <id>`,
+`--no-audio-part`. Max 2 model requests per pass per provider, then fall over; the request count and OpenRouter
+cost are logged at the end of the run and stored in `analysis.json → run.requests`.
+
+Cost per edit run on a 42 s clip (2 requests):
+- gemini-3.5-flash: ≈ 22k tokens pass 1 + ≈ 7k pass 2 (free tier: 20 requests/day per model).
+- qwen/qwen3.8-omni-flash via OpenRouter: ≈ $0.028 (35k in / 31k out incl. 14k reasoning for pass 1, 16k / 12k for
+  pass 2), ~9 min wall time.
 
 ## Accuracy Guardrails
 
