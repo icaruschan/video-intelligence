@@ -424,8 +424,13 @@ ASSET_CATS = [
 def assets(analysis: dict, frames: dict | None) -> list[dict]:
     a = analysis or {}
     out: list[dict] = []
-    for x in a.get("assets", []) or []:      # new schema field (model)
-        out.append({**x, "source": "pass1", "study_only": True})
+    for x in a.get("assets", []) or []:      # new schema field (model): normalise to kind/item/to_do
+        if not isinstance(x, dict):
+            x = {"item": str(x)}
+        item = str(x.get("item") or x.get("name") or x.get("description") or "unnamed asset")
+        kind = str(x.get("kind") or x.get("category") or "other")
+        to_do = x.get("to_do") or x.get("how_to_get")
+        out.append({**x, "kind": kind, "item": item, "to_do": to_do, "source": "pass1", "study_only": True})
     seen = {}
     for b in a.get("broll", {}).get("placements", []):
         c = str(b.get("content", ""))
@@ -841,8 +846,8 @@ def render_brief_md(b: dict) -> str:
         L.append(f"| {cv['parameter']} | {cv['value']} | {cv['source']} | {'yes' if cv['portable'] else 'ref-specific'} |")
     L.append("\n### 13g. Assets to source/build (reference material is STUDY-ONLY)\n")
     for x in b["assets"]:
-        L.append(f"- [{x['kind']}] {x['item']}" + (f" — {x.get('count_in_ref')} shots in ref" if x.get("count_in_ref") else "")
-                 + (f" · {x['to_do']}" if x.get("to_do") else "") + f" _[{x['source']}, study-only]_")
+        L.append(f"- [{x.get('kind', 'other')}] {x.get('item', '?')}" + (f" — {x.get('count_in_ref')} shots in ref" if x.get("count_in_ref") else "")
+                 + (f" · {x['to_do']}" if x.get("to_do") else "") + f" _[{x.get('source', '?')}, study-only]_")
     L.append("\n### 13h. Do not\n")
     for x in b["do_not"]:
         L.append(f"- **[{x['scope']}]** {x['rule']}" + (f" — _{x['note']}_" if x.get("note") else ""))

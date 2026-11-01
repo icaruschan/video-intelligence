@@ -752,5 +752,12 @@ def run_edit_mode(args, chain, path: Path, measure_mod) -> tuple[dict, str]:
     result["run"]["requests"] = chain.stats.summary()
     out_dir = Path(args.out) if args.out else Path("output") / path.stem
     postprocess(result, path, out_dir, frames=not getattr(args, "no_frames", False))
+    # Save the paid model output before rendering, so a render bug never loses a run
+    # (re-render later with --from-json). analyze_video.py overwrites this on success.
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "analysis.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=float))
+    except Exception as error:
+        print(f"[warning] could not pre-save analysis.json: {error}", file=sys.stderr)
     report = render_report(path, result)
     return result, report
